@@ -6,9 +6,15 @@ using namespace std;
 
 // Constants(ish)
 const long N = 1000 * 32;
-int RANK_SIZE;
-int MY_RANK;
+#define WORLD (MPI::COMM_WORLD)
+//int RANK_SIZE;
+#define RANK_SIZE (MPI::COMM_WORLD.Get_rank())
+//int MY_RANK;
+#define MY_RANK (MPI::COMM_WORLD.Get_size())
 #define BLOCK_SIZE (N/RANK_SIZE)
+
+const long SORT_MAX = numeric_limits<long>::max();
+const long SORT_MIN = numeric_limits<long>::lowest();
 
 // Global vars
 vector<long> section;
@@ -18,13 +24,13 @@ vector<long> sorted;
 void init_array();
 int find_bucket(long val);
 void find_displacements(long* section, int* bucket_displacements);
-void check_arrays();
+bool check_arrays();
 
 int main(void){
-    MPI_Init(NULL, NULL);
+    MPI::Init();
     // Find Rank and size
-    MPI_Comm_rank(MPI_COMM_WORLD, &MY_RANK);
-    MPI_Comm_size(MPI_COMM_WORLD, &RANK_SIZE);
+    //MPI_Comm_rank(MPI_COMM_WORLD, &MY_RANK);
+    //MPI_Comm_size(MPI_COMM_WORLD, &RANK_SIZE);
     init_array();
 
     // Sort local section and find divisions
@@ -37,32 +43,46 @@ int main(void){
     }
     counts.push_back(section.size() - bucket_displacements[RANK_SIZE - 1]);
 
+    cout << "Send and receive buckets" << endl;
     // Send and receive buckets
-    int* recv_counts = new int[RANK_SIZE];
-    MPI_Alltoall(&counts[0], 1, MPI_INT, recv_counts, 1, MPI_INT, MPI_COMM_WORLD);
-    int* recv_displacements = new int[RANK_SIZE];
+    vector<int> recv_counts(RANK_SIZE);
+    //int* recv_counts = new int[RANK_SIZE];
+    WORLD.Alltoall(&counts[0], 1, MPI::INT, &recv_counts[0], 1, MPI::INT);
+    vector<int> recv_displacements(RANK_SIZE);
+    //int* recv_displacements = new int[RANK_SIZE];
     recv_displacements[0] = 0;
+    long total_counts = recv_counts[0];
     for(int i = 1; i < RANK_SIZE; i++){
         recv_displacements[i] = recv_counts[i] + recv_displacements[i - 1];
+        total_counts += recv_counts[i];
     }
-    sorted.resize(recv_displacements[RANK_SIZE - 1] + recv_displacements[RANK_SIZE - 2]);
-    MPI_Alltoallv(&section[0], &counts[0], &bucket_displacements[0], MPI_LONG, &sorted[0], recv_counts, recv_displacements, MPI_LONG, MPI_COMM_WORLD);
+    sorted.resize(total_counts);
+    WORLD.Alltoallv(&section[0], &counts[0], &bucket_displacements[0], MPI::LONG, &sorted[0], &recv_counts[0], &recv_displacements[0], MPI::LONG);
 
+    cout << "Complete sort" << endl;
     // Complete sort
     sort(sorted.begin(), sorted.end());
 
     // Check array
-    check_arrays();
+    int all_passed, my_passed = check_arrays();
+    WORLD.Reduce(&my_passed, &all_passed, 1, MPI::BOOL, MPI::LAND, 0);
+    if(MY_RANK == 0){
+        if(all_passed){
+            cout << "Sort completed correctly" << endl;
+        } else {
+            cout << "Sort did not complete correctly" << endl;
+        }
+    }
 
     // Clean up
-    MPI_Finalize();
+    MPI::Finalize();
 }
 
 void init_array(){
     // Initialize the array
     section.reserve(BLOCK_SIZE);
     default_random_engine generator;
-    uniform_int_distribution<long> distribution(numeric_limits<long>::lowest(), numeric_limits<long>::max());
+    uniform_int_distribution<long> distribution(SORT_MIN, SORT_MAX);
     for(long i = 0; i < BLOCK_SIZE; i++){
         section.push_back(distribution(generator));
     }
@@ -85,32 +105,33 @@ long get_max_sorted(){
 long get_min_sorted(){
     return sorted.front();
 }
-void check_arrays(){
-    long left_max = numeric_limits<long>::max();
-    long right_min = numeric_limits<long>::lowest();
+bool check_arrays(){
+    long left_max = SORT_MIN;
+    long right_min = SORT_MAX;
     long my_max = get_max_sorted();
     long my_min = get_min_sorted();
-    int left_rank = MY_RANK == 0 ? MPI_PROC_NULL : MY_RANK - 1;
-    int right_rank = MY_RANK == RANK_SIZE - 1 ? MPI_PROC_NULL : MY_RANK + 1;
-    MPI_Status left_status, right_status;
-    MPI_Sendrecv(&my_min, 1, MPI_LONG, left_rank, 0, &right_min, 1, MPI_LONG, right_rank, 0, MPI_COMM_WORLD, &left_status);
-    MPI_Sendrecv(&my_max, 1, MPI_LONG, right_rank, 0, &left_max, 1, MPI_LONG, left_rank, 0, MPI_COMM_WORLD, &right_status);
+    int left_rank = MY_RANK == 0 ? MPI::PROC_NULL : MY_RANK - 1;
+    int right_rank = MY_RANK == RANK_SIZE - 1 ? MPI::PROC_NULL : MY_RANK + 1;
+    MPI::Status left_status, right_status;
+    WORLD.Sendrecv(&my_min, 1, MPI::LONG, left_rank, 0, &right_min, 1, MPI::LONG, right_rank, 0, left_status);
+    WORLD.Sendrecv(&my_max, 1, MPI::LONG, right_rank, 0, &left_max, 1, MPI::LONG, left_rank, 0, right_status);
 
     if(left_max >= my_min){
         cout << "Rank " << MY_RANK << " Sort Failed, " << left_max << " >= " << my_min << endl;
-        return;
+        return false;
     }
     if(right_min <= my_max){
         cout << "Rank " << MY_RANK << " Sort Failed, " << right_min << "<=" << my_max << endl;
-        return;
+        return false;
     }
+    return true;
 }
 
 
 int find_bucket(long val){
-    long step = (numeric_limits<long>::max() / RANK_SIZE - numeric_limits<long>::lowest() / RANK_SIZE);
+    long step = (SORT_MAX / RANK_SIZE - SORT_MIN / RANK_SIZE);
     for(long i = 0; i < RANK_SIZE; i++){
-        if((val >= numeric_limits<long>::lowest() + (i * step)) && (val < numeric_limits<long>::lowest() + ((i+1) * step))){
+        if((val >= SORT_MIN + (i * step)) && (val < SORT_MIN + ((i+1) * step))){
             return (int)i;
         }
     }
